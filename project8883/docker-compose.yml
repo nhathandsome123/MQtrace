@@ -1,0 +1,193 @@
+# ==========================================================
+# Docker Compose Stack: EMQX + HAProxy + InfluxDB + IDS
+# ==========================================================
+
+services:
+  # ==========================================================
+  # 🔐 HAProxy - TLS Termination Proxy for MQTT
+  # ==========================================================
+  haproxy:
+    image: haproxy:2.9
+    container_name: haproxy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./certs:/usr/local/etc/haproxy/certs:ro
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - emqx
+
+  # ==========================================================
+  # 🟢 EMQX MQTT Broker
+  # ==========================================================
+  emqx:
+    image: emqx/emqx:5.0.13
+    container_name: emqx
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1883:1883"
+      - "18083:18083"
+    environment:
+      - EMQX_DASHBOARD__DEFAULT_USERNAME=admin
+      - EMQX_DASHBOARD__DEFAULT_PASSWORD=public
+
+      # Authentication
+      - EMQX_AUTHENTICATION__1__ENABLE=true
+      - EMQX_AUTHENTICATION__1__MECHANISM=password_based
+      - EMQX_AUTHENTICATION__1__BACKEND=built_in_database
+      - EMQX_AUTHENTICATION__1__PASSWORD_HASH_ALGORITHM__NAME=sha256
+      - EMQX_AUTHENTICATION__1__PASSWORD_HASH_ALGORITHM__SALT_POSITION=prefix
+
+      # Authorization
+      - EMQX_AUTHORIZATION__NO_MATCH=deny
+      - EMQX_AUTHORIZATION__SOURCES__1__TYPE=file
+      - EMQX_AUTHORIZATION__SOURCES__1__ENABLE=true
+      - EMQX_AUTHORIZATION__SOURCES__1__PATH=/opt/emqx/etc/acl.conf
+      - EMQX_AUTHORIZATION__SOURCES__2__TYPE=built_in_database
+      - EMQX_AUTHORIZATION__SOURCES__2__ENABLE=false
+
+      - EMQX_NODE__COOKIE=dev_cookie_change_me
+      - EMQX_LISTENER__TCP__EXTERNAL__ENABLE=true
+      - EMQX_LISTENER__TCP__EXTERNAL__PORT=1883
+#    volumes:
+#      - ./certs:/opt/emqx/etc/certs:ro
+#      - ./acl.conf:/opt/emqx/etc/acl.conf:ro
+    networks:
+      - iot-net
+
+  # ==========================================================
+  # 🟣 InfluxDB 2.7
+  # ==========================================================
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123
+      - DOCKER_INFLUXDB_INIT_ORG=iot-org
+      - DOCKER_INFLUXDB_INIT_BUCKET=iot-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=iot-admin-token-123
+    networks:
+      - iot-net
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================
+  # 📝 EVE Forwarder - Đọc log Suricata → InfluxDB
+  # ==========================================================
+  eve-forwarder:
+    container_name: eve-forwarder
+    build:
+      context: .
+      dockerfile: Dockerfile.forwarder
+    restart: unless-stopped
+    networks:
+      - iot-net
+    volumes:
+      - /var/log/suricata:/var/log/suricata:ro
+    environment:
+      - INFLUX_URL=http://influxdb:8086
+      - INFLUX_TOKEN=iot-admin-token-123
+      - INFLUX_ORG=iot-org
+      - INFLUX_BUCKET=iot-data
+      - EVE_DIR=/var/log/suricata
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  # ==========================================================
+  # 🔍 Rule Detector (Phiên bản mới nhất v1.4)
+  # ==========================================================
+  rule-detector:
+    container_name: rule-detector
+    build:
+      context: .
+      dockerfile: dockerfile
+    restart: unless-stopped
+    networks:
+      - iot-net
+    environment:
+      - INFLUX_URL=http://influxdb:8086
+      - INFLUX_TOKEN=iot-admin-token-123
+      - INFLUX_ORG=iot-org
+      - SRC_BUCKET=iot-data
+      - ALERT_BUCKET=iot-data
+
+      - EMAIL_USER=Hieuttde160484@fpt.edu.vn
+      - EMAIL_PASS=slvfzzsbyhnobcgi
+      # - EMAIL_TO=nhatt7404@gmail.com
+
+      - FLOOD_STORM_ALLOWED_PREFIXES=replayer-
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  # ==========================================================
+  # 📊 Grafana - Dashboard phân tích IDS & MQTT
+  # ==========================================================
+  grafana:
+    image: grafana/grafana:9.2.1
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-influxdb-flux-datasource
+
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - grafana-config:/etc/grafana
+
+    networks:
+      - iot-net
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  # ==========================================================
+  # 📉 Prometheus + Node Exporter
+  # ==========================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus
+    networks:
+      - iot-net
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    networks:
+      - iot-net
+
+# ==========================================================
+# Networks + Volumes
+# ==========================================================
+networks:
+  iot-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  grafana-data:
+  grafana-config:
